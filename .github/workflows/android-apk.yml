@@ -6,7 +6,7 @@ on:
       version:
         description: Version written into the release tag
         required: false
-        default: 0.0.0
+        default: 1.2.0
 
 permissions:
   contents: write
@@ -19,14 +19,18 @@ jobs:
   apk:
     name: Build APK
     runs-on: ubuntu-latest
+
+    # The game itself. Both the manifest check and the packager read these, so
+    # they are defined once here rather than typed into each step — an unset one
+    # used to leave the check curling an empty URL and the build dying before it
+    # ever packaged anything.
+    env:
+      GAME_URL: https://pure-hand-vr.base44.app/play
+      MANIFEST_URL: https://pure-hand-vr.base44.app/manifest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -40,11 +44,6 @@ jobs:
       # for the retired "tools" package, which the current sdkmanager cannot
       # find and fails on, and pinning a cmdline-tools version makes it reject
       # the SDK the runner image already ships. Neither belongs in the build.
-      #
-      # The hosted runner already carries a full SDK. This step points the build
-      # at it, installs the command-line tools only if they are somehow absent,
-      # accepts the licences, and installs the exact platform and build tools the
-      # Capacitor 6 / AGP 8.2.1 template compiles against.
       - name: Set up the Android SDK
         run: |
           set -euo pipefail
@@ -61,7 +60,8 @@ jobs:
           # No tools at all: install the official command-line tools package.
           if ! command -v sdkmanager > /dev/null; then
             echo "sdkmanager not found — installing the Android command-line tools"
-            curl -fsSL -o /tmp/cmdline-tools.zip               https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
             rm -rf /tmp/cmdline-tools
             unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
             mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -69,7 +69,7 @@ jobs:
             export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
           fi
 
-          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+          export PATH="$ANDROID_HOME/platform-tools:$PATH"
 
           # Both names, for every tool that reads one or the other.
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
@@ -77,72 +77,122 @@ jobs:
           echo "$(dirname "$(command -v sdkmanager)")" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
-          echo "ANDROID_HOME=$ANDROID_HOME"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           echo "sdkmanager $(sdkmanager --version)"
-
-          # Licences first, then the packages themselves.
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
           sdkmanager --list_installed | grep -E "platforms;android-34|build-tools;34.0.0|platform-tools"
 
-      # AGP 8.2.1 needs a JDK 17 toolchain; this prints the pair actually in use.
-      - name: Check the toolchain
+      # One certificate for every build. The key is created on the first run and
+      # committed, so every later build signs with exactly the same certificate
+      # and installs straight over the previous version.
+      - name: Keep one signing key for every build
         run: |
-          java -version
-          echo "JAVA_HOME=$JAVA_HOME"
-          node --version
+          set -euo pipefail
+          if [ -f signing/release.keystore ]; then
+            echo "Reusing the signing key already in the repository."
+            exit 0
+          fi
 
-      - name: Prepare the wrapper
+          mkdir -p signing
+          keytool -genkeypair -v \
+            -keystore signing/release.keystore \
+            -storetype PKCS12 \
+            -alias picklevr \
+            -keyalg RSA -keysize 2048 -validity 10950 \
+            -storepass picklevr-release \
+            -keypass picklevr-release \
+            -dname "CN=Pickle VR, O=Pickle VR, C=US"
+
+          git config user.name "pickle-vr-build"
+          git config user.email "build@users.noreply.github.com"
+          git add signing/release.keystore
+          git commit -m "Add the Pickle VR release signing key"
+          git push
+
+      # The package is only as good as the manifest it wraps: this fails here,
+      # before anything is packaged, if the game is not publishing one.
+      - name: Check the game manifest
         run: |
-          mkdir -p wrapper/www
-          cat > wrapper/www/index.html <<'HTML'
-          <!doctype html>
-          <html lang="en">
-          <head>
-          <meta charset="utf-8">
-          <meta name="viewport" content="width=device-width, initial-scale=1">
-          <title>Pickle VR</title>
-          </head>
-          <body style="margin:0;background:#070a0d;color:#ffffff;font-family:sans-serif">
-          <p style="padding:24px">Connecting to Pickle VR...</p>
-          </body>
-          </html>
-          HTML
+          set -euo pipefail
+          echo "Reading $MANIFEST_URL"
+          STATUS="$(curl -sSL -o manifest.json -w '%{http_code}' "$MANIFEST_URL")"
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::The live app answered $STATUS for $MANIFEST_URL. The published app is older than this code: publish the app, then run the build again."
+            exit 1
+          fi
+          cat manifest.json
+          grep -q '"start_url"' manifest.json
+          grep -q '"icons"' manifest.json
+          grep -q '/play' manifest.json
 
-      - name: Install Capacitor
-        working-directory: wrapper
+      # Meta's packager, which builds the library entry for the manifest.
+      - name: Download the Meta packager
         run: |
-          npm init -y > /dev/null
-          npm install --no-audit --no-fund @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          set -euo pipefail
+          curl -fL --retry 3 --retry-delay 5 -o ovr-platform-util \
+            "https://www.oculus.com/download_app/?id=5159709737372459&access_token=OC%7C5159709737372459%7C"
+          chmod +x ovr-platform-util
+          ./ovr-platform-util version
+          ./ovr-platform-util help | tee packager-help.txt
+          # Fail with a readable reason rather than a wall of YAML if the tool
+          # ever stops offering this command.
+          grep -q "create-pwa" packager-help.txt
 
-      - name: Configure the app
-        working-directory: wrapper
+      # Every release has to out-rank the one already on the headset, or the
+      # headset refuses it as a downgrade.
+      - name: Work out the version code
+        id: versioncode
         run: |
-          cat > capacitor.config.json <<'JSON'
-          {
-            "appId": "com.picklevr.game",
-            "appName": "Pickle VR",
-            "webDir": "www",
-            "server": { "url": "https://pure-hand-vr.base44.app/play", "androidScheme": "https" },
-            "android": { "allowMixedContent": false }
-          }
-          JSON
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          MAJOR="$(printf '%s' "$VERSION" | cut -d. -f1)"
+          MINOR="$(printf '%s' "$VERSION" | cut -d. -f2)"
+          PATCH="$(printf '%s' "$VERSION" | cut -d. -f3)"
+          MAJOR=${MAJOR:-0}
+          MINOR=${MINOR:-0}
+          PATCH=${PATCH:-0}
+          CODE=$(( (10#$MAJOR * 10000) + (10#$MINOR * 100) + (10#$PATCH) ))
 
-      - name: Add the Android platform
-        working-directory: wrapper
-        run: npx cap add android
+          # The run number only ever goes up, so it is the floor: a build can
+          # never ship a version code below one already used.
+          if [ "$CODE" -lt ${{ github.run_number }} ]; then
+            CODE=${{ github.run_number }}
+          fi
 
-      - name: Point Gradle at the SDK
-        working-directory: wrapper
-        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "Version $VERSION -> versionCode $CODE"
 
+      # The packager wraps the game's own URL: the APK opens the 3D lobby, not
+      # the website, and it is signed with the repository's one key.
+      # The flags below are the tool's own (ovr-platform-util create-pwa --help):
+      # it repacks a template APK around the web manifest, so the manifest — not
+      # a URL typed here — is what decides where the app opens.
       - name: Build the APK
-        working-directory: wrapper/android
-        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon --stacktrace
+        run: |
+          set -euo pipefail
 
-      - name: Name the build
-        run: cp wrapper/android/app/build/outputs/apk/debug/app-debug.apk "PickleVR-${{ inputs.version }}.apk"
+          # The packager repacks a template APK, which is not shipped with the
+          # tool. Say that plainly instead of failing with a bare stack trace.
+          TEMPLATE="${PWA_TEMPLATE:-pwa-template.apk}"
+          if [ ! -f "$TEMPLATE" ]; then
+            echo "::error::No template APK found at $TEMPLATE. Download Meta's PWA template APK into the repository (or set PWA_TEMPLATE to its path) and run the build again."
+            exit 1
+          fi
+
+          ./ovr-platform-util create-pwa \
+            -o "PickleVR-${{ inputs.version }}.apk" \
+            --web-manifest-url "$MANIFEST_URL" \
+            --android-sdk "$ANDROID_HOME" \
+            --apk-template "$TEMPLATE" \
+            --package-name "com.picklevr.game" \
+            --version-code "${{ steps.versioncode.outputs.code }}" \
+            --version-name "${{ inputs.version }}" \
+            --keystore signing/release.keystore \
+            --ks-pass pass:picklevr-release \
+            --key-pass pass:picklevr-release \
+            --ks-key-alias picklevr
+
+          ls -l PickleVR-*.apk
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
@@ -150,4 +200,9 @@ jobs:
           tag_name: v${{ inputs.version }}
           name: Pickle VR v${{ inputs.version }}
           files: PickleVR-*.apk
-          body: Android build v${{ inputs.version }}. Sideload it on Meta Quest.
+          body: |
+            Meta Quest build v${{ inputs.version }} (versionCode ${{ steps.versioncode.outputs.code }}).
+
+            Signed with the same key as every previous build, so it installs
+            straight over the version already on the headset — no uninstall, and
+            saved progress is kept.
