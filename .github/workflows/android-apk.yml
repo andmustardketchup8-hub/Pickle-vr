@@ -20,13 +20,10 @@ jobs:
     name: Build APK
     runs-on: ubuntu-latest
 
-    # The game itself. Both the manifest check and the packager read these, so
-    # they are defined once here rather than typed into each step — an unset one
-    # used to leave the check curling an empty URL and the build dying before it
-    # ever packaged anything.
+    # The game itself, defined once here rather than typed into each step.
     env:
       GAME_URL: https://pure-hand-vr.base44.app/play
-      MANIFEST_URL: https://pure-hand-vr.base44.app/manifest
+      PACKAGE: com.picklevr.game
 
     steps:
       - name: Checkout
@@ -109,34 +106,22 @@ jobs:
           git commit -m "Add the Pickle VR release signing key"
           git push
 
-      # The package is only as good as the manifest it wraps: this fails here,
-      # before anything is packaged, if the game is not publishing one.
-      - name: Check the game manifest
+      # A keystore that cannot be opened fails the whole build at signing time
+      # with a stack trace. Checked here first, so the reason is unmistakable.
+      - name: Check the signing key
         run: |
           set -euo pipefail
-          echo "Reading $MANIFEST_URL"
-          STATUS="$(curl -sSL -o manifest.json -w '%{http_code}' "$MANIFEST_URL")"
-          if [ "$STATUS" != "200" ]; then
-            echo "::error::The live app answered $STATUS for $MANIFEST_URL. The published app is older than this code: publish the app, then run the build again."
+          if ! keytool -list -keystore signing/release.keystore \
+            -storepass picklevr-release -alias picklevr > /dev/null; then
+            echo "::error::signing/release.keystore cannot be opened with the build's password and alias. Delete it from the repository and run the build again so a fresh key is created."
             exit 1
           fi
-          cat manifest.json
-          grep -q '"start_url"' manifest.json
-          grep -q '"icons"' manifest.json
-          grep -q '/play' manifest.json
+          echo "The release key is readable."
 
-      # Meta's packager, which builds the library entry for the manifest.
-      - name: Download the Meta packager
-        run: |
-          set -euo pipefail
-          curl -fL --retry 3 --retry-delay 5 -o ovr-platform-util \
-            "https://www.oculus.com/download_app/?id=5159709737372459&access_token=OC%7C5159709737372459%7C"
-          chmod +x ovr-platform-util
-          ./ovr-platform-util version
-          ./ovr-platform-util help | tee packager-help.txt
-          # Fail with a readable reason rather than a wall of YAML if the tool
-          # ever stops offering this command.
-          grep -q "create-pwa" packager-help.txt
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
       # Every release has to out-rank the one already on the headset, or the
       # headset refuses it as a downgrade.
@@ -162,37 +147,172 @@ jobs:
           echo "code=$CODE" >> "$GITHUB_OUTPUT"
           echo "Version $VERSION -> versionCode $CODE"
 
-      # The packager wraps the game's own URL: the APK opens the 3D lobby, not
-      # the website, and it is signed with the repository's one key.
-      # The flags below are the tool's own (ovr-platform-util create-pwa --help):
-      # it repacks a template APK around the web manifest, so the manifest — not
-      # a URL typed here — is what decides where the app opens.
+      # The Android project is written here, at build time, so the repository
+      # carries no generated Gradle files to drift out of date. It is a small
+      # native shell: the game itself stays the web app it already is.
+      - name: Write the Android project
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/java/com/picklevr/game app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+            repositories {
+              google()
+              mavenCentral()
+              gradlePluginPortal()
+            }
+          }
+
+          dependencyResolutionManagement {
+            repositories {
+              google()
+              mavenCentral()
+            }
+          }
+
+          rootProject.name = 'PickleVR'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application' version '8.4.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+            id 'com.android.application'
+          }
+
+          android {
+            namespace 'com.picklevr.game'
+            compileSdk 34
+
+            defaultConfig {
+              applicationId 'com.picklevr.game'
+              minSdk 29
+              targetSdk 34
+              versionCode (findProperty('appVersionCode') ?: '1').toInteger()
+              versionName findProperty('appVersionName') ?: '1.0.0'
+            }
+
+            // Signed with the key committed to the repository, so an update
+            // installs over the previous build instead of clashing with it.
+            signingConfigs {
+              release {
+                storeFile file('../signing/release.keystore')
+                storePassword 'picklevr-release'
+                keyAlias 'picklevr'
+                keyPassword 'picklevr-release'
+              }
+            }
+
+            buildTypes {
+              release {
+                signingConfig signingConfigs.release
+                minifyEnabled false
+              }
+            }
+
+            compileOptions {
+              sourceCompatibility JavaVersion.VERSION_17
+              targetCompatibility JavaVersion.VERSION_17
+            }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+            <uses-permission android:name="android.permission.INTERNET" />
+
+            <application
+              android:label="@string/app_name"
+              android:allowBackup="true">
+
+              <meta-data
+                android:name="com.oculus.supportedDevices"
+                android:value="quest|quest2|quest3|questpro" />
+
+              <activity
+                android:name=".MainActivity"
+                android:exported="true"
+                android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN" />
+                  <category android:name="android.intent.category.LAUNCHER" />
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <string name="app_name">Pickle VR</string>
+            <string name="game_url">$GAME_URL</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/picklevr/game/MainActivity.java <<'EOF'
+          package com.picklevr.game;
+
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Bundle;
+
+          /**
+           * Pickle VR is a WebXR app: its world is drawn by a WebXR runtime, and
+           * an Android WebView has none — a wrapped page can only show a flat
+           * panel with no way into VR. So this shell hands the game's own URL to
+           * the system browser (Quest Browser), which does have one, and the 3D
+           * lobby comes up as the real thing.
+           */
+          public class MainActivity extends Activity {
+            @Override
+            protected void onCreate(Bundle savedInstanceState) {
+              super.onCreate(savedInstanceState);
+
+              Intent game = new Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse(getString(R.string.game_url))
+              );
+              game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+              startActivity(game);
+
+              finish();
+            }
+          }
+          EOF
+
+          echo "Project written:"
+          find app -type f | sort
+
       - name: Build the APK
         run: |
           set -euo pipefail
+          gradle assembleRelease --no-daemon --stacktrace \
+            -PappVersionCode="${{ steps.versioncode.outputs.code }}" \
+            -PappVersionName="${{ inputs.version }}"
+          ls -l app/build/outputs/apk/release/
 
-          # The packager repacks a template APK, which is not shipped with the
-          # tool. Say that plainly instead of failing with a bare stack trace.
-          TEMPLATE="${PWA_TEMPLATE:-pwa-template.apk}"
-          if [ ! -f "$TEMPLATE" ]; then
-            echo "::error::No template APK found at $TEMPLATE. Download Meta's PWA template APK into the repository (or set PWA_TEMPLATE to its path) and run the build again."
-            exit 1
-          fi
+      # The package name, the version and the signing certificate are read back
+      # out of the finished APK, so a wrong one shows up here instead of on a
+      # headset.
+      - name: Name and check the build
+        run: |
+          set -euo pipefail
+          APK="PickleVR-${{ inputs.version }}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "$APK"
+          ls -l "$APK"
 
-          ./ovr-platform-util create-pwa \
-            -o "PickleVR-${{ inputs.version }}.apk" \
-            --web-manifest-url "$MANIFEST_URL" \
-            --android-sdk "$ANDROID_HOME" \
-            --apk-template "$TEMPLATE" \
-            --package-name "com.picklevr.game" \
-            --version-code "${{ steps.versioncode.outputs.code }}" \
-            --version-name "${{ inputs.version }}" \
-            --keystore signing/release.keystore \
-            --ks-pass pass:picklevr-release \
-            --key-pass pass:picklevr-release \
-            --ks-key-alias picklevr
-
-          ls -l PickleVR-*.apk
+          TOOLS="$ANDROID_HOME/build-tools/34.0.0"
+          "$TOOLS/aapt" dump badging "$APK" | grep -E "^package|^application-label|^launchable-activity" || true
+          "$TOOLS/apksigner" verify --print-certs "$APK" | head -3 || true
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
