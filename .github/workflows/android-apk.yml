@@ -116,28 +116,6 @@ jobs:
         with:
           gradle-version: "8.7"
 
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-
-      # The game, built as plain static files. Not the website build: no server
-      # code, no router, no platform SDK — just the game, its maps and its models,
-      # ready to be served from the headset.
-      - name: Build the game bundle
-        run: |
-          set -euo pipefail
-          npm ci --no-audit --no-fund
-          npx vite build --config vite.standalone.config.mjs
-
-          test -f dist-standalone/index.html
-          echo "Game bundle:"
-          ls -la dist-standalone
-          echo "Models:"
-          ls -la dist-standalone/models
-          du -sh dist-standalone
-
       # Every release has to out-rank the one already on the headset, or the
       # headset refuses it as a downgrade.
       - name: Work out the version code
@@ -636,14 +614,59 @@ jobs:
           echo "Project written:"
           find app -type f | sort
 
-      # The game itself, copied into the APK. Everything the player sees — the
-      # lobby, every map, the models — is in here, so nothing has to be fetched.
+      # The game itself, packed into the APK. Everything the player sees — the
+      # lobby, every map, the models — ends up in here, so the app has nothing to
+      # fetch at run time.
+      #
+      # The bundle is taken from the published app, which is where the game is
+      # built. The copy committed in the repository is used when the published
+      # app has not been updated yet, so a build never fails over that.
       - name: Pack the game into the APK
         run: |
           set -euo pipefail
           rm -rf app/src/main/assets/game
           mkdir -p app/src/main/assets/game
-          cp -R dist-standalone/. app/src/main/assets/game/
+
+          if GAME_BASE="https://pure-hand-vr.base44.app" node --input-type=module - <<'EOF'
+          import { mkdir, writeFile } from "node:fs/promises";
+          import { dirname } from "node:path";
+
+          const base = process.env.GAME_BASE;
+
+          try {
+            const manifestResponse = await fetch(base + "/game/bundle.json");
+            if (!manifestResponse.ok) {
+              throw new Error("bundle.json answered " + manifestResponse.status);
+            }
+            const manifest = await manifestResponse.json();
+
+            const wanted = [
+              ...manifest.files.map((file) => ({ file, url: base + "/game/" + file })),
+              ...manifest.models.map((file) => ({ file: "models/" + file, url: base + "/models/" + file })),
+            ];
+
+            for (const { file, url } of wanted) {
+              const response = await fetch(url);
+              if (!response.ok) {
+                throw new Error(file + " answered " + response.status);
+              }
+              const body = Buffer.from(await response.arrayBuffer());
+              const target = "app/src/main/assets/game/" + file;
+              await mkdir(dirname(target), { recursive: true });
+              await writeFile(target, body);
+              console.log("from the published app: " + file + " " + body.length);
+            }
+          } catch (problem) {
+            console.log("The published app did not serve a bundle (" + problem.message + ").");
+            process.exit(1);
+          }
+          EOF
+          then
+            echo "Game taken from the published app."
+          else
+            echo "Using the game bundle committed in the repository."
+            cp -R game/. app/src/main/assets/game/
+          fi
 
           test -f app/src/main/assets/game/index.html
           test -f app/src/main/assets/game/models/pistol.glb
