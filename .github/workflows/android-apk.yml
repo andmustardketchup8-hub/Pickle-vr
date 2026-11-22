@@ -1,0 +1,97 @@
+name: Android APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version written into the release tag
+        required: false
+        default: 0.0.0
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    name: Build APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up the Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Prepare the wrapper
+        run: |
+          mkdir -p wrapper/www
+          cat > wrapper/www/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <title>Pickle VR</title>
+          </head>
+          <body style="margin:0;background:#070a0d;color:#ffffff;font-family:sans-serif">
+          <p style="padding:24px">Connecting to Pickle VR...</p>
+          </body>
+          </html>
+          HTML
+
+      - name: Install Capacitor
+        working-directory: wrapper
+        run: |
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+
+      - name: Configure the app
+        working-directory: wrapper
+        run: |
+          cat > capacitor.config.json <<'JSON'
+          {
+            "appId": "com.picklevr.game",
+            "appName": "Pickle VR",
+            "webDir": "www",
+            "server": { "url": "https://pure-hand-vr.base44.app", "androidScheme": "https" },
+            "android": { "allowMixedContent": false }
+          }
+          JSON
+
+      - name: Add the Android platform
+        working-directory: wrapper
+        run: npx cap add android
+
+      - name: Point Gradle at the SDK
+        working-directory: wrapper
+        run: echo "sdk.dir=$ANDROID_HOME" > android/local.properties
+
+      - name: Build the APK
+        working-directory: wrapper/android
+        run: chmod +x gradlew && ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Name the build
+        run: cp wrapper/android/app/build/outputs/apk/debug/app-debug.apk "PickleVR-${{ inputs.version }}.apk"
+
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: Pickle VR v${{ inputs.version }}
+          files: PickleVR-*.apk
+          body: Android build v${{ inputs.version }}. Sideload it on Meta Quest.
