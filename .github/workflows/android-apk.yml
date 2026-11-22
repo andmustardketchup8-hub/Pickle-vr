@@ -186,6 +186,11 @@ jobs:
             id 'com.android.application'
           }
 
+          // Read once, into plain values: passing an expression straight into
+          // versionCode makes Groovy call it instead of assigning it.
+          def appCode = (project.findProperty('appVersionCode') ?: '1').toString().toInteger()
+          def appName = (project.findProperty('appVersionName') ?: '1.0.0').toString()
+
           android {
             namespace 'com.picklevr.game'
             compileSdk 34
@@ -194,8 +199,8 @@ jobs:
               applicationId 'com.picklevr.game'
               minSdk 29
               targetSdk 34
-              versionCode (findProperty('appVersionCode') ?: '1').toInteger()
-              versionName findProperty('appVersionName') ?: '1.0.0'
+              versionCode appCode
+              versionName appName
             }
 
             // Signed with the key committed to the repository, so an update
@@ -291,6 +296,8 @@ jobs:
 
           echo "Project written:"
           find app -type f | sort
+          echo "--- app/build.gradle ---"
+          sed -n '1,60p' app/build.gradle
 
       - name: Build the APK
         run: |
