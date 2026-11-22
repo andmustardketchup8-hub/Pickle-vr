@@ -37,7 +37,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       # The runtime's toolchain is a repo-local SDK, NDK and V8: about 3 GB. The
       # runner image carries a second Android SDK we never use, so it goes first.
@@ -83,60 +83,20 @@ jobs:
           fi
           echo "The release key is readable."
 
-      # The game itself: the same build the website serves, taken from the
-      # published app and falling back to the copy committed here, so a build
-      # never fails because the site has not been published yet.
-      - name: Pack the game into the app
+      # The game the APK carries: the offline bundle committed in this repository,
+      # in the game folder. Nothing is downloaded and nothing has to be published
+      # first, so the APK is always built from exactly the game that was tested.
+      - name: Check the game bundle
         run: |
           set -euo pipefail
-          rm -rf /tmp/www
-          mkdir -p /tmp/www
 
-          if GAME_BASE="https://pure-hand-vr.base44.app" node --input-type=module - <<'EOF'
-          import { mkdir, writeFile } from "node:fs/promises";
-          import { dirname } from "node:path";
-
-          const base = process.env.GAME_BASE;
-
-          try {
-            const manifestResponse = await fetch(base + "/game/bundle.json");
-            if (!manifestResponse.ok) {
-              throw new Error("bundle.json answered " + manifestResponse.status);
+          for need in index.html models/pistol.glb models/shotgun.glb; do
+            test -f "game/$need" || {
+              echo "::error::The game bundle in the repository is missing $need."
+              exit 1
             }
-            const manifest = await manifestResponse.json();
+          done
 
-            const wanted = [
-              ...manifest.files.map((file) => ({ file, url: base + "/game/" + file })),
-              ...manifest.models.map((file) => ({ file: "models/" + file, url: base + "/models/" + file })),
-            ];
-
-            for (const { file, url } of wanted) {
-              const response = await fetch(url);
-              if (!response.ok) {
-                throw new Error(file + " answered " + response.status);
-              }
-              const body = Buffer.from(await response.arrayBuffer());
-              const target = "/tmp/www/" + file;
-              await mkdir(dirname(target), { recursive: true });
-              await writeFile(target, body);
-              console.log("from the published app: " + file + " " + body.length);
-            }
-          } catch (problem) {
-            console.log("The published app did not serve a bundle (" + problem.message + ").");
-            process.exit(1);
-          }
-          EOF
-          then
-            rm -rf game
-            mkdir -p game
-            cp -R /tmp/www/. game/
-            echo "Game taken from the published app."
-          else
-            echo "Using the game committed in the repository."
-          fi
-
-          test -f game/index.html
-          test -f game/models/pistol.glb
           echo "The game:"
           find game -type f | sort
           du -sh game
