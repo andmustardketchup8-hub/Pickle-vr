@@ -6,7 +6,7 @@ on:
       version:
         description: Version written into the release tag
         required: false
-        default: 1.6.0
+        default: 1.9.0
 
 permissions:
   contents: write
@@ -22,20 +22,20 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # The runtime that makes this a Quest app instead of a browser tab: V8 for
       # the game's JavaScript, WebGL 2 on the headset's own GLES driver, and
       # WebXR over OpenXR. It is checked out beside the game and compiled here.
       - name: Checkout the OpenXR runtime
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: Srile/webxr-to-native
           ref: 5de044b0ab890e373dfd122e90590b3626a9f43f
           path: host-runtime
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -138,8 +138,7 @@ jobs:
               "canvasText": true
             },
             "xr": {
-              "autoEnter": true,
-              "clearFrame": true
+              "autoEnter": true
             }
           }
           EOF
@@ -190,8 +189,19 @@ jobs:
           done
           echo "The APK carries the game and the OpenXR runtime."
 
+      # The built APK, kept with the run itself. The release is the copy a player
+      # downloads; this is the copy of the run that produced it, so a build can be
+      # checked without going through the release page — and the run's Artifacts
+      # section is never empty again.
+      - name: Upload the APK
+        uses: actions/upload-artifact@v7
+        with:
+          name: PickleVR-${{ inputs.version }}
+          path: PickleVR-*.apk
+          if-no-files-found: error
+
       - name: Publish the release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: v${{ inputs.version }}
           name: Pickle VR v${{ inputs.version }}
