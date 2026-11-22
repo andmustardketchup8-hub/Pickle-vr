@@ -2,9 +2,9 @@
   "version": 1,
   "note": "The offline Pickle VR bundle the Android build packs into the APK: index.html, its assets, and the models under models/.",
   "files": [
-    "index.html",
-    "assets/index-2eG2XOYW.css",
-    "assets/index-BXoefV_k.js"
+    "assets/index-4xDw7KTz.css",
+    "assets/index-C77tWZjT.js",
+    "index.html"
   ],
   "models": [
     "pistol-magazine.glb",
