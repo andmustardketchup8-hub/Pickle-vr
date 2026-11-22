@@ -34,31 +34,57 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # The action's own default package list still asks for the retired "tools"
-      # package, which the current sdkmanager (cmdline-tools 16) cannot find, so
-      # it exits 1 and the step fails. The list is given explicitly instead.
-      - name: Set up the Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platform-tools"
-          cmdline-tools-version: "16.0"
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-
-      # The SDK root, the licences and the exact platform and build tools the
+      # The Android SDK is driven directly here.
+      #
+      # android-actions/setup-android is not used: its default package list asks
+      # for the retired "tools" package, which the current sdkmanager cannot
+      # find and fails on, and pinning a cmdline-tools version makes it reject
+      # the SDK the runner image already ships. Neither belongs in the build.
+      #
+      # The hosted runner already carries a full SDK. This step points the build
+      # at it, installs the command-line tools only if they are somehow absent,
+      # accepts the licences, and installs the exact platform and build tools the
       # Capacitor 6 / AGP 8.2.1 template compiles against.
-      - name: Install the SDK packages
+      - name: Set up the Android SDK
         run: |
           set -euo pipefail
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          mkdir -p "$ANDROID_HOME"
+
+          # Use the command-line tools already on the image, wherever they sit.
+          CMDLINE="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin 2>/dev/null | head -n 1 || true)"
+          if [ -n "$CMDLINE" ]; then
+            export PATH="$CMDLINE:$PATH"
+          fi
+
+          # No tools at all: install the official command-line tools package.
+          if ! command -v sdkmanager > /dev/null; then
+            echo "sdkmanager not found — installing the Android command-line tools"
+            curl -fsSL -o /tmp/cmdline-tools.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            rm -rf /tmp/cmdline-tools
+            unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            mv /tmp/cmdline-tools/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest"
+            export PATH="$ANDROID_HOME/cmdline-tools/latest/bin:$PATH"
+          fi
+
+          export PATH="$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator:$PATH"
+
+          # Both names, for every tool that reads one or the other.
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$(command -v sdkmanager)")" >> "$GITHUB_PATH"
+          echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
+
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
           echo "sdkmanager $(sdkmanager --version)"
+
+          # Licences first, then the packages themselves.
           yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
           sdkmanager --list_installed | grep -E "platforms;android-34|build-tools;34.0.0|platform-tools"
 
       # AGP 8.2.1 needs a JDK 17 toolchain; this prints the pair actually in use.
