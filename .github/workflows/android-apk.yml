@@ -6,7 +6,7 @@ on:
       version:
         description: Version written into the release tag
         required: false
-        default: 1.4.0
+        default: 1.6.0
 
 permissions:
   contents: write
@@ -113,7 +113,8 @@ jobs:
             "app": {
               "name": "Pickle VR",
               "package": "com.picklevr.game",
-              "version": "${{ inputs.version }}"
+              "version": "${{ inputs.version }}",
+              "splash": "splash.png"
             },
             "mode": "js",
             "web": {
@@ -122,7 +123,8 @@ jobs:
               "canvasText": true
             },
             "xr": {
-              "autoEnter": true
+              "autoEnter": true,
+              "clearFrame": true
             }
           }
           EOF
