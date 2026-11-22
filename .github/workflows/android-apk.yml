@@ -34,8 +34,39 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # The action's own default package list still asks for the retired "tools"
+      # package, which the current sdkmanager (cmdline-tools 16) cannot find, so
+      # it exits 1 and the step fails. The list is given explicitly instead.
       - name: Set up the Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools"
+          cmdline-tools-version: "16.0"
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
+
+      # The SDK root, the licences and the exact platform and build tools the
+      # Capacitor 6 / AGP 8.2.1 template compiles against.
+      - name: Install the SDK packages
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          export ANDROID_SDK_ROOT="$ANDROID_HOME"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+          echo "sdkmanager $(sdkmanager --version)"
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0" > /dev/null
+          sdkmanager --list_installed | grep -E "platforms;android-34|build-tools;34.0.0|platform-tools"
+
+      # AGP 8.2.1 needs a JDK 17 toolchain; this prints the pair actually in use.
+      - name: Check the toolchain
+        run: |
+          java -version
+          echo "JAVA_HOME=$JAVA_HOME"
+          node --version
 
       - name: Prepare the wrapper
         run: |
