@@ -61,8 +61,7 @@ jobs:
           # No tools at all: install the official command-line tools package.
           if ! command -v sdkmanager > /dev/null; then
             echo "sdkmanager not found — installing the Android command-line tools"
-            curl -fsSL -o /tmp/cmdline-tools.zip \
-              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            curl -fsSL -o /tmp/cmdline-tools.zip               https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
             rm -rf /tmp/cmdline-tools
             unzip -q /tmp/cmdline-tools.zip -d /tmp/cmdline-tools
             mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -125,7 +124,7 @@ jobs:
             "appId": "com.picklevr.game",
             "appName": "Pickle VR",
             "webDir": "www",
-            "server": { "url": "https://pure-hand-vr.base44.app", "androidScheme": "https" },
+            "server": { "url": "https://pure-hand-vr.base44.app/play", "androidScheme": "https" },
             "android": { "allowMixedContent": false }
           }
           JSON
