@@ -39,6 +39,21 @@ jobs:
         with:
           node-version: "22"
 
+      # The packager turns the splash image into the PNG the headset shows from
+      # launch until the game's first frame, and it does that with ImageMagick.
+      # The runners ship ImageMagick 6, whose command is convert, so the name the
+      # packager calls is pointed at it. Without this the pack fails before it
+      # ever reaches the game.
+      - name: Image tools for the splash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+          if ! command -v magick > /dev/null 2>&1; then
+            sudo ln -sf "$(command -v convert)" /usr/local/bin/magick
+          fi
+          magick -version | head -2
+
       # The runtime's toolchain is a repo-local SDK, NDK and V8: about 3 GB. The
       # runner image carries a second Android SDK we never use, so it goes first.
       - name: Free disk space
