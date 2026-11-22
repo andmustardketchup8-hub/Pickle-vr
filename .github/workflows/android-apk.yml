@@ -6,7 +6,7 @@ on:
       version:
         description: Version written into the release tag
         required: false
-        default: 1.2.0
+        default: 1.3.0
 
 permissions:
   contents: write
@@ -20,9 +20,7 @@ jobs:
     name: Build APK
     runs-on: ubuntu-latest
 
-    # The game itself, defined once here rather than typed into each step.
     env:
-      GAME_URL: https://pure-hand-vr.base44.app/play
       PACKAGE: com.picklevr.game
 
     steps:
@@ -48,13 +46,11 @@ jobs:
           export ANDROID_SDK_ROOT="$ANDROID_HOME"
           mkdir -p "$ANDROID_HOME"
 
-          # Use the command-line tools already on the image, wherever they sit.
           CMDLINE="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin 2>/dev/null | head -n 1 || true)"
           if [ -n "$CMDLINE" ]; then
             export PATH="$CMDLINE:$PATH"
           fi
 
-          # No tools at all: install the official command-line tools package.
           if ! command -v sdkmanager > /dev/null; then
             echo "sdkmanager not found — installing the Android command-line tools"
             curl -fsSL -o /tmp/cmdline-tools.zip \
@@ -68,7 +64,6 @@ jobs:
 
           export PATH="$ANDROID_HOME/platform-tools:$PATH"
 
-          # Both names, for every tool that reads one or the other.
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$(dirname "$(command -v sdkmanager)")" >> "$GITHUB_PATH"
@@ -106,8 +101,6 @@ jobs:
           git commit -m "Add the Pickle VR release signing key"
           git push
 
-      # A keystore that cannot be opened fails the whole build at signing time
-      # with a stack trace. Checked here first, so the reason is unmistakable.
       - name: Check the signing key
         run: |
           set -euo pipefail
@@ -122,6 +115,28 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # The game, built as plain static files. Not the website build: no server
+      # code, no router, no platform SDK — just the game, its maps and its models,
+      # ready to be served from the headset.
+      - name: Build the game bundle
+        run: |
+          set -euo pipefail
+          npm ci --no-audit --no-fund
+          npx vite build --config vite.standalone.config.mjs
+
+          test -f dist-standalone/index.html
+          echo "Game bundle:"
+          ls -la dist-standalone
+          echo "Models:"
+          ls -la dist-standalone/models
+          du -sh dist-standalone
 
       # Every release has to out-rank the one already on the headset, or the
       # headset refuses it as a downgrade.
@@ -138,8 +153,6 @@ jobs:
           PATCH=${PATCH:-0}
           CODE=$(( (10#$MAJOR * 10000) + (10#$MINOR * 100) + (10#$PATCH) ))
 
-          # The run number only ever goes up, so it is the floor: a build can
-          # never ship a version code below one already used.
           if [ "$CODE" -lt ${{ github.run_number }} ]; then
             CODE=${{ github.run_number }}
           fi
@@ -148,12 +161,11 @@ jobs:
           echo "Version $VERSION -> versionCode $CODE"
 
       # The Android project is written here, at build time, so the repository
-      # carries no generated Gradle files to drift out of date. It is a small
-      # native shell: the game itself stays the web app it already is.
+      # carries no generated Gradle files to drift out of date.
       - name: Write the Android project
         run: |
           set -euo pipefail
-          mkdir -p app/src/main/java/com/picklevr/game app/src/main/res/values
+          mkdir -p app/src/main/java/com/picklevr/game app/src/main/res/values app/src/main/assets/game
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -221,6 +233,12 @@ jobs:
               }
             }
 
+            // The game is served straight out of the APK, so its files are kept
+            // as they are rather than packed for the Android loader.
+            androidResources {
+              noCompress 'glb'
+            }
+
             compileOptions {
               sourceCompatibility JavaVersion.VERSION_17
               targetCompatibility JavaVersion.VERSION_17
@@ -232,6 +250,9 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
             <uses-permission android:name="android.permission.INTERNET" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+            <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+            <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
             <application
               android:label="@string/app_name"
@@ -250,15 +271,19 @@ jobs:
                   <category android:name="android.intent.category.LAUNCHER" />
                 </intent-filter>
               </activity>
+
+              <service
+                android:name=".GameServerService"
+                android:exported="false"
+                android:foregroundServiceType="dataSync" />
             </application>
           </manifest>
           EOF
 
-          cat > app/src/main/res/values/strings.xml <<EOF
+          cat > app/src/main/res/values/strings.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
             <string name="app_name">Pickle VR</string>
-            <string name="game_url">$GAME_URL</string>
           </resources>
           EOF
 
@@ -267,37 +292,364 @@ jobs:
 
           import android.app.Activity;
           import android.content.Intent;
+          import android.graphics.Color;
           import android.net.Uri;
+          import android.os.Build;
           import android.os.Bundle;
+          import android.view.Gravity;
+          import android.widget.TextView;
 
           /**
-           * Pickle VR is a WebXR app: its world is drawn by a WebXR runtime, and
-           * an Android WebView has none — a wrapped page can only show a flat
-           * panel with no way into VR. So this shell hands the game's own URL to
-           * the system browser (Quest Browser), which does have one, and the 3D
-           * lobby comes up as the real thing.
+           * Opens the game that is packaged inside this app.
+           *
+           * The game is WebXR, and this headset's only WebXR runtime is the system
+           * browser: an Android app cannot open an immersive session by itself. So
+           * the whole game — lobby, every map, the models and sounds — ships inside
+           * the APK, a local server hands it out on a loopback port, and the VR
+           * runtime is given that local address. No website is contacted and the
+           * headset needs no network.
            */
           public class MainActivity extends Activity {
+
             @Override
             protected void onCreate(Bundle savedInstanceState) {
               super.onCreate(savedInstanceState);
 
-              Intent game = new Intent(
-                Intent.ACTION_VIEW,
-                Uri.parse(getString(R.string.game_url))
-              );
-              game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-              startActivity(game);
+              TextView status = new TextView(this);
+              status.setText("Starting Pickle VR…");
+              status.setTextColor(Color.WHITE);
+              status.setGravity(Gravity.CENTER);
+              status.setBackgroundColor(Color.rgb(7, 10, 13));
+              setContentView(status);
 
-              finish();
+              Intent service = new Intent(this, GameServerService.class);
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(service);
+              } else {
+                startService(service);
+              }
+
+              // The server answers within a moment. Waited for off the main
+              // thread so the app never freezes while it comes up.
+              new Thread(() -> {
+                int ready = 0;
+                for (int attempt = 0; attempt < 120 && ready == 0; attempt++) {
+                  ready = GameServerService.port;
+                  if (ready == 0) {
+                    try {
+                      Thread.sleep(50);
+                    } catch (InterruptedException stop) {
+                      break;
+                    }
+                  }
+                }
+
+                final int port = ready == 0 ? 8731 : ready;
+                runOnUiThread(() -> {
+                  Intent game = new Intent(
+                      Intent.ACTION_VIEW, Uri.parse("http://127.0.0.1:" + port + "/"));
+                  game.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                  startActivity(game);
+                  finish();
+                });
+              }).start();
+            }
+          }
+          EOF
+
+          cat > app/src/main/java/com/picklevr/game/GameServerService.java <<'EOF'
+          package com.picklevr.game;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.Service;
+          import android.content.Intent;
+          import android.os.Build;
+          import android.os.IBinder;
+
+          /**
+           * Keeps the game's local server alive for the whole session.
+           *
+           * Once the VR runtime takes over the screen this app is in the
+           * background, where Android may reclaim it — which would kill the game
+           * mid-play. A foreground service keeps the process, and therefore the
+           * game, running until the player is done.
+           */
+          public class GameServerService extends Service {
+
+            private static final String CHANNEL = "pickle-vr";
+
+            /** The loopback port the game is being served on, or 0 until it is up. */
+            static volatile int port = 0;
+
+            private AssetServer server;
+
+            @Override
+            public int onStartCommand(Intent intent, int flags, int startId) {
+              if (server == null) {
+                try {
+                  server = new AssetServer(getAssets(), 8731);
+                  server.start();
+                  port = server.port();
+                } catch (Exception failed) {
+                  port = 0;
+                }
+              }
+              startForeground(1, notification());
+              return START_STICKY;
+            }
+
+            private Notification notification() {
+              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                NotificationManager manager = getSystemService(NotificationManager.class);
+                if (manager != null && manager.getNotificationChannel(CHANNEL) == null) {
+                  manager.createNotificationChannel(new NotificationChannel(
+                      CHANNEL, "Pickle VR", NotificationManager.IMPORTANCE_LOW));
+                }
+              }
+
+              Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                  ? new Notification.Builder(this, CHANNEL)
+                  : new Notification.Builder(this);
+
+              return builder
+                  .setContentTitle("Pickle VR")
+                  .setContentText("The game is running on this headset")
+                  .setSmallIcon(android.R.drawable.ic_media_play)
+                  .setOngoing(true)
+                  .build();
+            }
+
+            @Override
+            public void onDestroy() {
+              if (server != null) {
+                server.stop();
+              }
+              super.onDestroy();
+            }
+
+            @Override
+            public IBinder onBind(Intent intent) {
+              return null;
+            }
+          }
+          EOF
+
+          cat > app/src/main/java/com/picklevr/game/AssetServer.java <<'EOF'
+          package com.picklevr.game;
+
+          import android.content.res.AssetManager;
+
+          import java.io.ByteArrayOutputStream;
+          import java.io.IOException;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.InetAddress;
+          import java.net.ServerSocket;
+          import java.net.Socket;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+
+          /**
+           * Serves the packaged game to the VR runtime from this device.
+           *
+           * Every file it returns comes out of the APK. A loopback address is used
+           * because 127.0.0.1 counts as a secure origin, which is what WebXR
+           * requires, and because it keeps the game on the headset: nothing is
+           * fetched from the network.
+           */
+          final class AssetServer {
+
+            private final AssetManager assets;
+            private final ExecutorService pool = Executors.newCachedThreadPool();
+            private ServerSocket socket;
+            private int port;
+
+            AssetServer(AssetManager assets, int firstPort) throws IOException {
+              this.assets = assets;
+              for (int candidate = firstPort; candidate < firstPort + 10; candidate++) {
+                try {
+                  socket = new ServerSocket(candidate, 50, InetAddress.getByName("127.0.0.1"));
+                  port = candidate;
+                  break;
+                } catch (IOException busy) {
+                  // Taken by something else: try the next one.
+                }
+              }
+              if (socket == null) {
+                throw new IOException("No free loopback port");
+              }
+            }
+
+            int port() {
+              return port;
+            }
+
+            void start() {
+              Thread acceptor = new Thread(() -> {
+                while (!socket.isClosed()) {
+                  try {
+                    Socket client = socket.accept();
+                    pool.execute(() -> serve(client));
+                  } catch (IOException closed) {
+                    break;
+                  }
+                }
+              });
+              acceptor.setDaemon(true);
+              acceptor.start();
+            }
+
+            void stop() {
+              try {
+                socket.close();
+              } catch (IOException ignored) {
+                // Already closed.
+              }
+              pool.shutdownNow();
+            }
+
+            private void serve(Socket client) {
+              try (Socket connection = client) {
+                connection.setSoTimeout(15000);
+                InputStream in = connection.getInputStream();
+
+                String request = readLine(in);
+                if (request == null) {
+                  return;
+                }
+                String header;
+                while ((header = readLine(in)) != null && !header.isEmpty()) {
+                  // Headers carry nothing this server needs.
+                }
+
+                String[] parts = request.split(" ");
+                String path = parts.length > 1 ? parts[1] : "/";
+                int query = path.indexOf('?');
+                if (query >= 0) {
+                  path = path.substring(0, query);
+                }
+                if (path.isEmpty() || path.equals("/")) {
+                  path = "/index.html";
+                }
+                path = path.replace("..", "");
+
+                byte[] body;
+                String type;
+                try {
+                  body = readAll(assets.open("game" + path));
+                  type = mimeFor(path);
+                } catch (IOException missing) {
+                  // A route with no file behind it: the game's own page.
+                  body = readAll(assets.open("game/index.html"));
+                  type = "text/html; charset=utf-8";
+                }
+
+                OutputStream out = connection.getOutputStream();
+                String head = "HTTP/1.1 200 OK\r\n"
+                    + "Content-Type: " + type + "\r\n"
+                    + "Content-Length: " + body.length + "\r\n"
+                    + "Cache-Control: no-store\r\n"
+                    + "Access-Control-Allow-Origin: *\r\n"
+                    + "Connection: close\r\n\r\n";
+                out.write(head.getBytes("UTF-8"));
+                out.write(body);
+                out.flush();
+              } catch (IOException ignored) {
+                // The browser hung up: nothing to answer.
+              }
+            }
+
+            private static String readLine(InputStream in) throws IOException {
+              ByteArrayOutputStream line = new ByteArrayOutputStream();
+              int c;
+              while ((c = in.read()) != -1) {
+                if (c == '\n') {
+                  break;
+                }
+                if (c != '\r') {
+                  line.write(c);
+                }
+              }
+              if (c == -1 && line.size() == 0) {
+                return null;
+              }
+              return line.toString("UTF-8");
+            }
+
+            private static byte[] readAll(InputStream in) throws IOException {
+              try (InputStream stream = in) {
+                ByteArrayOutputStream out = new ByteArrayOutputStream();
+                byte[] buffer = new byte[16384];
+                int read;
+                while ((read = stream.read(buffer)) != -1) {
+                  out.write(buffer, 0, read);
+                }
+                return out.toByteArray();
+              }
+            }
+
+            private static String mimeFor(String path) {
+              String lower = path.toLowerCase();
+              if (lower.endsWith(".html")) {
+                return "text/html; charset=utf-8";
+              }
+              if (lower.endsWith(".js") || lower.endsWith(".mjs")) {
+                return "text/javascript; charset=utf-8";
+              }
+              if (lower.endsWith(".css")) {
+                return "text/css; charset=utf-8";
+              }
+              if (lower.endsWith(".json")) {
+                return "application/json";
+              }
+              if (lower.endsWith(".glb")) {
+                return "model/gltf-binary";
+              }
+              if (lower.endsWith(".gltf")) {
+                return "model/gltf+json";
+              }
+              if (lower.endsWith(".png")) {
+                return "image/png";
+              }
+              if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) {
+                return "image/jpeg";
+              }
+              if (lower.endsWith(".svg")) {
+                return "image/svg+xml";
+              }
+              if (lower.endsWith(".wasm")) {
+                return "application/wasm";
+              }
+              if (lower.endsWith(".woff2")) {
+                return "font/woff2";
+              }
+              if (lower.endsWith(".ico")) {
+                return "image/x-icon";
+              }
+              return "application/octet-stream";
             }
           }
           EOF
 
           echo "Project written:"
           find app -type f | sort
-          echo "--- app/build.gradle ---"
-          sed -n '1,60p' app/build.gradle
+
+      # The game itself, copied into the APK. Everything the player sees — the
+      # lobby, every map, the models — is in here, so nothing has to be fetched.
+      - name: Pack the game into the APK
+        run: |
+          set -euo pipefail
+          rm -rf app/src/main/assets/game
+          mkdir -p app/src/main/assets/game
+          cp -R dist-standalone/. app/src/main/assets/game/
+
+          test -f app/src/main/assets/game/index.html
+          test -f app/src/main/assets/game/models/pistol.glb
+          echo "Packaged game:"
+          find app/src/main/assets/game -type f | sort
+          du -sh app/src/main/assets/game
 
       - name: Build the APK
         run: |
@@ -307,19 +659,27 @@ jobs:
             -PappVersionName="${{ inputs.version }}"
           ls -l app/build/outputs/apk/release/
 
-      # The package name, the version and the signing certificate are read back
-      # out of the finished APK, so a wrong one shows up here instead of on a
-      # headset.
+      # Read back out of the finished APK: the package name, the version, the
+      # signing certificate, and proof that the game is actually inside it.
       - name: Name and check the build
         run: |
           set -euo pipefail
           APK="PickleVR-${{ inputs.version }}.apk"
           cp app/build/outputs/apk/release/app-release.apk "$APK"
-          ls -l "$APK"
+          ls -lh "$APK"
 
           TOOLS="$ANDROID_HOME/build-tools/34.0.0"
           "$TOOLS/aapt" dump badging "$APK" | grep -E "^package|^application-label|^launchable-activity" || true
           "$TOOLS/apksigner" verify --print-certs "$APK" | head -3 || true
+
+          echo "Game files inside the APK:"
+          unzip -l "$APK" | grep -E "assets/game/(index.html|models/)" | head -10
+          COUNT="$(unzip -l "$APK" | grep -c "assets/game/" || true)"
+          echo "Packaged game files: $COUNT"
+          if [ "$COUNT" -lt 6 ]; then
+            echo "::error::The game bundle is missing from the APK."
+            exit 1
+          fi
 
       - name: Publish the release
         uses: softprops/action-gh-release@v2
@@ -330,6 +690,9 @@ jobs:
           body: |
             Meta Quest build v${{ inputs.version }} (versionCode ${{ steps.versioncode.outputs.code }}).
 
+            The whole game ships inside the APK — the lobby, every sandbox map,
+            every story chapter and the weapon models — and is served from the
+            headset itself, so it plays with no network.
+
             Signed with the same key as every previous build, so it installs
-            straight over the version already on the headset — no uninstall, and
-            saved progress is kept.
+            straight over the version already on the headset.
