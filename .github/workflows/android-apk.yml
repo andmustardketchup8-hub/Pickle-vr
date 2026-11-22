@@ -101,35 +101,136 @@ jobs:
       # The game the APK carries: the offline bundle committed in this repository,
       # in the game folder. Nothing is downloaded and nothing has to be published
       # first, so the APK is always built from exactly the game that was tested.
+      #
+      # Everything below is checked against the files that are actually present:
+      # the page's own script and stylesheet tags, the models, and the absence of
+      # any network reference. bundle.json — the bundle's inventory — is WRITTEN
+      # from that list rather than kept by hand. It used to be kept by hand and
+      # drifted, so an APK shipped an inventory naming an older build's files.
       - name: Check the game bundle
         run: |
           set -euo pipefail
+          cat > "$RUNNER_TEMP/game-bundle.mjs" <<'NODE'
+          import fs from "node:fs";
+          import path from "node:path";
 
-          for need in index.html models/pistol.glb models/shotgun.glb; do
-            test -f "game/$need" || {
-              echo "::error::The game bundle in the repository is missing $need."
-              exit 1
+          const root = "game";
+          const fail = (message) => {
+            console.error("::error::" + message);
+            process.exit(1);
+          };
+
+          const walk = (dir, base) => {
+            const prefix = base || "";
+            const found = [];
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const rel = prefix ? prefix + "/" + entry.name : entry.name;
+              if (entry.isDirectory()) found.push(...walk(path.join(dir, entry.name), rel));
+              else found.push(rel);
             }
-          done
+            return found;
+          };
 
-          echo "The game:"
-          find game -type f | sort
-          du -sh game
+          // What the page itself asks for: its module and its stylesheet. Read
+          // from the page's own tags, so the inventory can only ever name files
+          // this build really references.
+          const quote = String.fromCharCode(34);
+          const html = fs.readFileSync(path.join(root, "index.html"), "utf8");
+          const referenced = html
+            .split(quote)
+            .map((value) => (value.startsWith("./") ? value.slice(2) : value))
+            .filter((value) => value.startsWith("assets/") && (value.endsWith(".js") || value.endsWith(".css")))
+            .sort();
+          if (!referenced.length) fail("game/index.html loads no script or stylesheet.");
+          for (const file of referenced) {
+            if (!fs.existsSync(path.join(root, file))) {
+              fail("game/index.html loads " + file + ", which is not in the bundle.");
+            }
+          }
+
+          const models = fs.readdirSync(path.join(root, "models")).filter((name) => name.endsWith(".glb")).sort();
+          if (models.length < 4) fail("The bundle holds " + models.length + " models; the game needs all four.");
+
+          // Offline: no external asset may be referenced anywhere in the bundle.
+          const stop = new Set(
+            [32, 9, 10, 34, 39, 40, 41, 60, 62, 44, 59, 96].map((code) => String.fromCharCode(code))
+          );
+          const urls = (text) => {
+            const found = [];
+            for (const prefix of ["https://", "http://"]) {
+              let index = text.indexOf(prefix);
+              while (index !== -1) {
+                let end = index;
+                while (end < text.length && !stop.has(text[end])) end += 1;
+                found.push(text.slice(index, end));
+                index = text.indexOf(prefix, end);
+              }
+            }
+            return found;
+          };
+
+          const external = [];
+          const sources = walk(root).filter(
+            (name) => name.endsWith(".js") || name.endsWith(".css") || name.endsWith(".html")
+          );
+          for (const file of sources) {
+            for (const url of urls(fs.readFileSync(path.join(root, file), "utf8"))) {
+              if (url.startsWith("http://www.w3.org") || url.startsWith("https://www.w3.org")) continue;
+              if (url.startsWith("http://react.dev") || url.startsWith("https://react.dev")) continue;
+              external.push(file + ": " + url);
+            }
+          }
+          if (external.length) fail("The bundle reaches the network: " + external.slice(0, 3).join(", "));
+
+          // The inventory, written from the files on disk, then read back.
+          const all = walk(root).filter((file) => file !== "bundle.json").sort();
+          const manifest = {
+            version: 1,
+            note: "The offline Pickle VR bundle the Android build packs into the APK: index.html, its assets, and the models under models/.",
+            files: all.filter((file) => !file.startsWith("models/")),
+            models: all.filter((file) => file.startsWith("models/")).map((file) => file.slice("models/".length)),
+          };
+          fs.writeFileSync(path.join(root, "bundle.json"), JSON.stringify(manifest, null, 2));
+
+          const written = JSON.parse(fs.readFileSync(path.join(root, "bundle.json"), "utf8"));
+          const listed = [...written.files, ...written.models.map((name) => "models/" + name)];
+          const missing = listed.filter((file) => !fs.existsSync(path.join(root, file)));
+          if (missing.length) fail("bundle.json lists files that are not in the bundle: " + missing.join(", "));
+
+          console.log("The game bundle: " + listed.length + " files, every one present, no network references.");
+          for (const file of listed) {
+            console.log("  " + file + "  " + fs.statSync(path.join(root, file)).size + " bytes");
+          }
+          NODE
+          node "$RUNNER_TEMP/game-bundle.mjs"
 
       # How the runtime is told to run it: the game's folder, the headset session
       # opened on launch (there is no browser and no page chrome to click), and
       # Canvas 2D text, which the game's own plates and readouts are drawn with.
+      #
+      # The splash is named the way the packager writes it into the APK —
+      # assets/vr_splash.png — so the host.json carried inside the APK points at
+      # a file that is really in it. The source image is staged under that name
+      # first: it used to be splash.png, and the packaged host.json kept that
+      # name while the APK itself held vr_splash.png.
       - name: Point the runtime at the game
         run: |
           set -euo pipefail
           mkdir -p native
+          if [ ! -f native/vr_splash.png ] && [ -f native/splash.png ]; then
+            cp native/splash.png native/vr_splash.png
+          fi
+          test -f native/vr_splash.png || {
+            echo "::error::The splash image is missing: put it at native/vr_splash.png."
+            exit 1
+          }
           cat > native/host.json <<EOF
           {
             "app": {
               "name": "Pickle VR",
               "package": "com.picklevr.game",
               "version": "${{ inputs.version }}",
-              "splash": "splash.png"
+              "splash": "vr_splash.png"
             },
             "mode": "js",
             "web": {
@@ -188,6 +289,55 @@ jobs:
             }
           done
           echo "The APK carries the game and the OpenXR runtime."
+
+          # The manifests read back out of the finished APK. Every file
+          # bundle.json lists, every script and stylesheet index.html loads, and
+          # the splash host.json names all have to be in the APK — and the host's
+          # entry point has to be the JavaScript that was actually packed. A
+          # manifest describing a different build than the one packed is exactly
+          # the fault this check exists to catch.
+          unzip -p "$APK" assets/www/bundle.json > "$RUNNER_TEMP/apk-bundle.json"
+          cat > "$RUNNER_TEMP/check-apk.mjs" <<'NODE'
+          import fs from "node:fs";
+          import { execFileSync } from "node:child_process";
+
+          const apk = process.argv[2];
+          const fail = (message) => {
+            console.error("::error::" + message);
+            process.exit(1);
+          };
+
+          const newline = String.fromCharCode(10);
+          const entries = execFileSync("unzip", ["-Z1", apk], { encoding: "utf8" }).split(newline).filter(Boolean);
+          const game = new Set(
+            entries.filter((name) => name.startsWith("assets/www/")).map((name) => name.slice("assets/www/".length))
+          );
+
+          const manifest = JSON.parse(fs.readFileSync(process.argv[3], "utf8"));
+          const listed = [...manifest.files, ...manifest.models.map((name) => "models/" + name)];
+          const missing = listed.filter((file) => !game.has(file));
+          if (missing.length) fail("bundle.json lists files that are not in the APK: " + missing.join(", "));
+
+          const html = execFileSync("unzip", ["-p", apk, "assets/www/index.html"], { encoding: "utf8" });
+          const refs = html
+            .split(String.fromCharCode(34))
+            .map((value) => (value.startsWith("./") ? value.slice(2) : value))
+            .filter((value) => value.startsWith("assets/") && (value.endsWith(".js") || value.endsWith(".css")));
+          if (!refs.length) fail("The APK's index.html loads no script or stylesheet.");
+          const broken = refs.filter((ref) => !game.has(ref));
+          if (broken.length) fail("index.html loads files that are not in the APK: " + broken.join(", "));
+
+          const host = JSON.parse(execFileSync("unzip", ["-p", apk, "assets/host.json"], { encoding: "utf8" }));
+          const splash = "assets/" + host.app.splash;
+          if (!entries.includes(splash)) fail("host.json names a splash that is not in the APK: " + splash);
+          if (!game.has(host.web.entry)) fail("The host's entry point is not in the APK: " + host.web.entry);
+
+          console.log("bundle.json: " + listed.length + " files, all present in the APK");
+          console.log("index.html loads: " + refs.join(", "));
+          console.log("entry: " + host.web.entry + " (present)");
+          console.log("splash: " + splash);
+          NODE
+          node "$RUNNER_TEMP/check-apk.mjs" "$APK" "$RUNNER_TEMP/apk-bundle.json"
 
       # The built APK, kept with the run itself. The release is the copy a player
       # downloads; this is the copy of the run that produced it, so a build can be
